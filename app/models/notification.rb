@@ -25,9 +25,12 @@ class Notification < ApplicationRecord
   belongs_to :repository, foreign_key: :repository_full_name, primary_key: :full_name, optional: true
   has_many :labels, through: :subject
 
+  validates :subject_url, presence: true
+  validates :archived, inclusion: [true, false]
+
   scope :unmuted,  -> { where("muted_at IS NULL") }
   scope :muted,    -> { where("muted_at IS NOT NULL") }
-  scope :inbox,    -> { where(archived: false) }
+  scope :inbox,    -> { where.not(archived: true) }
   scope :archived, ->(value = true) { where(archived: value) }
   scope :newest,   -> { order('notifications.updated_at DESC') }
   scope :starred,  ->(value = true) { where(starred: value) }
@@ -38,22 +41,90 @@ class Notification < ApplicationRecord
       repo_names.map { |repo_name| arel_table[:repository_full_name].matches(repo_name) }.reduce(:or)
     )
   }
-  scope :type,     ->(subject_type) { where(subject_type: subject_type) }
-  scope :reason,   ->(reason)       { where(reason: reason) }
+  scope :exclude_repo, lambda { |repo_names|
+    repo_names = [repo_names] if repo_names.is_a?(String)
+    where.not(
+      repo_names.map { |repo_name| arel_table[:repository_full_name].matches(repo_name) }.reduce(:or)
+    )
+  }
+
+  scope :type,           ->(subject_type) { where(subject_type: subject_type) }
+  scope :exclude_type,   ->(subject_type) { where.not(subject_type: subject_type) }
+  scope :reason,         ->(reason)       { where(reason: reason) }
+  scope :exclude_reason, ->(reason)       { where.not(reason: reason) }
   scope :unread,   ->(unread)       { where(unread: unread) }
-  scope :owner,    ->(owner_name)   { where(arel_table[:repository_owner_name].matches(owner_name)) }
-  scope :author,   ->(author_name)  { joins(:subject).where(Subject.arel_table[:author].matches(author_name)) }
+  scope :owner,    ->(owner_names)   {
+    owner_names = [owner_names] if owner_names.is_a?(String)
+    where(
+      owner_names.map { |owner_name| arel_table[:repository_owner_name].matches(owner_name) }.reduce(:or)
+    )
+  }
+  scope :exclude_owner, ->(owner_names)   {
+    owner_names = [owner_names] if owner_names.is_a?(String)
+    where.not(
+      owner_names.map { |owner_name| arel_table[:repository_owner_name].matches(owner_name) }.reduce(:or)
+    )
+  }
+  scope :author, ->(author_names)  {
+    author_names = [author_names] if author_names.is_a?(String)
+    joins(:subject).where(
+      author_names.map { |author_name| Subject.arel_table[:author].matches(author_name) }.reduce(:or)
+    )
+  }
+  scope :exclude_author, ->(author_names)  {
+    author_names = [author_names] if author_names.is_a?(String)
+    joins(:subject).where.not(
+      author_names.map { |author_name| Subject.arel_table[:author].matches(author_name) }.reduce(:or)
+    )
+  }
 
   scope :is_private, ->(is_private = true) { joins(:repository).where('repositories.private = ?', is_private) }
 
-  scope :state,      ->(state)  { joins(:subject).where('subjects.state = ?', state) }
-  scope :author,     ->(author) { joins(:subject).where(Subject.arel_table[:author].matches(author)) }
+  scope :state, ->(states)  {
+    states = [states] if states.is_a?(String)
+    joins(:subject).where(
+      states.map { |state| Subject.arel_table[:state].matches(state) }.reduce(:or)
+    )
+  }
+  scope :exclude_state, ->(states)  {
+    states = [states] if states.is_a?(String)
+    joins(:subject).where.not(
+      states.map { |state| Subject.arel_table[:state].matches(state) }.reduce(:or)
+    )
+  }
 
   scope :labelable,  -> { where(subject_type: ['Issue', 'PullRequest']) }
-  scope :label,      ->(label_name) { joins(:labels).where(Label.arel_table[:name].matches(label_name))}
+  scope :label,      ->(label_names) {
+    label_names = [label_names] if label_names.is_a?(String)
+
+    joins(:labels).where(
+      label_names.map { |label_name| Label.arel_table[:name].matches(label_name) }.reduce(:or)
+    )
+
+  }
+  scope :exclude_label,      ->(label_names) {
+    label_names = [label_names] if label_names.is_a?(String)
+
+    joins(:labels).where.not(
+      label_names.map { |label_name| Label.arel_table[:name].matches(label_name) }.reduce(:or)
+    )
+
+  }
   scope :unlabelled, -> { labelable.with_subject.left_outer_joins(:labels).where(labels: {id: nil})}
 
-  scope :assigned,   ->(assignee) { joins(:subject).where("subjects.assignees LIKE ?", "%:#{assignee}:%") }
+  scope :assigned,   ->(assignees) {
+    assignees = [assignees] if assignees.is_a?(String)
+    joins(:subject).where(
+      assignees.map { |assignee| Subject.arel_table[:assignees].matches("%:#{assignee}:%") }.reduce(:or)
+    )
+  }
+  scope :exclude_assigned,   ->(assignees) {
+    assignees = [assignees] if assignees.is_a?(String)
+    joins(:subject).where.not(
+      assignees.map { |assignee| Subject.arel_table[:assignees].matches("%:#{assignee}:%") }.reduce(:or)
+    )
+  }
+
   scope :unassigned, -> { joins(:subject).where("subjects.assignees = '::'") }
   scope :locked,     -> { joins(:subject).where(subjects: { locked: true }) }
   scope :not_locked,     -> { joins(:subject).where(subjects: { locked: false }) }
@@ -95,33 +166,44 @@ class Notification < ApplicationRecord
     unread = notifications.select(&:unread)
     return if unread.empty?
     user = unread.first.user
+    MarkReadWorker.perform_async_if_configured(user.id, unread.map(&:github_id))
+    where(id: unread.map(&:id)).update_all(unread: false)
+  end
+
+  def self.mark_read_on_github(user, notification_ids)
     conn = user.github_client.client_without_redirects
     manager = Typhoeus::Hydra.new(max_concurrency: Octobox.config.max_concurrency)
     begin
       conn.in_parallel(manager) do
-        unread.each do |n|
-            conn.patch "notifications/threads/#{n.github_id}"
+        notification_ids.each do |id|
+            conn.patch "notifications/threads/#{id}"
         end
       end
     rescue Octokit::Forbidden, Octokit::NotFound
       # one or more notifications are for repos the user no longer has access to
     end
-    where(id: unread.map(&:id)).update_all(unread: false)
   end
 
   def self.mute(notifications)
     return if notifications.empty?
     user = notifications.to_a.first.user
+    MuteNotificationsWorker.perform_async_if_configured(user.id, notifications.map(&:github_id))
+    where(id: notifications.map(&:id)).update_all(archived: true, unread: false, muted_at: Time.current)
+  end
+
+  def self.mute_on_github(user, notification_ids)
     conn = user.github_client.client_without_redirects
     manager = Typhoeus::Hydra.new(max_concurrency: Octobox.config.max_concurrency)
-    conn.in_parallel(manager) do
-      notifications.each do |n|
-        conn.patch "notifications/threads/#{n.github_id}"
-        conn.put "notifications/threads/#{n.github_id}/subscription", {ignored: true}.to_json
+    begin
+      conn.in_parallel(manager) do
+        notification_ids.each do |id|
+          conn.patch "notifications/threads/#{id}"
+          conn.put "notifications/threads/#{id}/subscription", {ignored: true}.to_json
+        end
       end
+    rescue Octokit::Forbidden, Octokit::NotFound
+      # one or more notifications are for repos the user no longer has access to
     end
-
-    where(id: notifications.map(&:id)).update_all(archived: true, unread: false, muted_at: Time.current)
   end
 
   def expanded_subject_url
@@ -150,6 +232,7 @@ class Notification < ApplicationRecord
   def update_from_api_response(api_response, unarchive: false)
     attrs = Notification.attributes_from_api_response(api_response)
     self.attributes = attrs
+    archived = false if archived.nil? # fixup existing records where archived is nil
     unarchive_if_updated if unarchive
     save(touch: false) if changed?
     update_subject
@@ -157,7 +240,7 @@ class Notification < ApplicationRecord
   end
 
   def github_app_installed?
-    Octobox.github_app? && user.github_app_authorized? && repository.try(:github_app_installed?)
+    Octobox.github_app? && user.github_app_authorized? && repository.try(:display_subject?)
   end
 
   def subjectable?
@@ -170,6 +253,7 @@ class Notification < ApplicationRecord
 
   def update_subject(force = false)
     return unless display_subject?
+    return if !force && subject != nil && updated_at - subject.updated_at < 2.seconds
 
     UpdateSubjectWorker.perform_async_if_configured(self.id, force)
   end
@@ -225,13 +309,14 @@ class Notification < ApplicationRecord
 
   def update_repository(force = false)
     return unless Octobox.config.subjects_enabled?
+    return if !force && repository != nil && updated_at - repository.updated_at < 2.seconds
 
     UpdateRepositoryWorker.perform_async_if_configured(self.id, force)
   end
 
   def update_repository_in_foreground(force = false)
     return unless Octobox.config.subjects_enabled?
-    return if repository != nil && updated_at - repository.updated_at < 2.seconds
+    return if !force && repository != nil && updated_at - repository.updated_at < 2.seconds
 
     remote_repository = download_repository
 

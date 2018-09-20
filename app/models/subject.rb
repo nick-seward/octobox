@@ -43,7 +43,7 @@ class Subject < ApplicationRecord
 
   def sync_involved_users
     return unless Octobox.github_app?
-    involved_user_ids.each { |user_id| SyncNotificationsWorker.perform_async_if_configured(user_id) }
+    involved_user_ids.each { |user_id| SyncNotificationsWorker.perform_in(1.minute, user_id) }
   end
 
   def self.sync(remote_subject)
@@ -78,7 +78,9 @@ class Subject < ApplicationRecord
   end
 
   def involved_user_ids
-    (user_ids + Array(repository.try(:user_ids))).uniq
+    ids = users.pluck(:id)
+    ids += repository.users.not_recently_synced.pluck(:id) if repository.present?
+    ids.uniq
   end
 
   def author_url_path
